@@ -1,0 +1,791 @@
+"""三栏主窗口（深色风格 + 仅校验支持）。"""
+from __future__ import annotations
+
+import os
+import sys
+import threading
+from dataclasses import dataclass, field
+from typing import Optional
+
+from PySide6.QtCore import Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (
+    QApplication, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+    QPushButton, QSplitter, QStatusBar, QVBoxLayout, QWidget,
+)
+
+from config import XML_LOG_SUFFIX, REPORT_SUFFIX, NameConflictPolicy
+from core.notifier import build_copy_result_message, send_pushplus
+from gui.widgets.copy_panel import CopyPanel
+from gui.widgets.drive_panel import DrivePanel
+from gui.widgets.queue_panel import JobItemWidget, QueuePanel, _human_size
+from gui.widgets.settings_dialog import (
+    SettingsDialog,
+    load_pushplus_settings,
+)
+from gui.workers import (
+    CopyJobWorker, JobSummary, ScanResult, ScanWorker,
+    VerifyOnlyWorker, WorkerThread,
+)
+
+DARK_QSS = """
+QMainWindow, QDialog, QMessageBox { background-color: #1b1e23; color: #e0e0e0; }
+QWidget { font-family: 'Segoe UI','PingFang SC','Helvetica Neue',sans-serif;
+          font-size: 12px; color: #e0e0e0; }
+QMenu { background-color: #2a2d33; border: 1px solid #3e4248; padding: 4px 0; color: #e0e0e0; }
+QMenu::item { padding: 5px 24px 5px 12px; }
+QMenu::item:selected { background-color: #3a4a6b; }
+QComboBox { background-color: #2a2d33; border: 1px solid #4a4e55; border-radius: 5px;
+            padding: 5px 8px; color: #e0e0e0; }
+QComboBox:hover { border-color: #5f9efa; }
+QComboBox QAbstractItemView { background-color: #2a2d33; selection-background-color: #3a4a6b;
+                               color: #e0e0e0; border: 1px solid #3e4248; }
+QLineEdit { background-color: #25282e; border: 1px solid #4a4e55; border-radius: 5px;
+            padding: 5px 7px; color: #e0e0e0; selection-background-color: #3a4a6b; }
+QLineEdit:focus { border-color: #5f9efa; }
+QListWidget, QTreeView { background-color: #25282e; border: 1px solid #3e4248;
+                          border-radius: 6px; color: #e0e0e0; }
+QListWidget::item:selected, QTreeView::item:selected { background-color: #3a4a6b; color: #fff; }
+QScrollBar:vertical { background: #1b1e23; width: 8px; border-radius: 4px; }
+QScrollBar::handle:vertical { background: #4a4e55; border-radius: 4px; min-height: 24px; }
+QScrollBar::handle:vertical:hover { background: #5f6470; }
+QProgressBar { background-color: #25282e; border: 1px solid #3e4248; border-radius: 5px;
+               text-align: center; height: 16px; color: #e0e0e0; font-size: 10px; }
+QProgressBar::chunk { background-color: #4d8eff; border-radius: 4px; }
+QPushButton { background-color: #303540; border: 1px solid #4a4e55; border-radius: 5px;
+              padding: 5px 14px; color: #e0e0e0; }
+QPushButton:hover { background-color: #3a4250; border-color: #5f9efa; }
+QPushButton:pressed { background-color: #252a35; }
+QPushButton:disabled { background-color: #24282e; color: #5f6470; border-color: #353840; }
+QCheckBox { color: #c0c4cc; spacing: 6px; }
+QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #4a4e55;
+                       border-radius: 3px; background: #25282e; }
+QCheckBox::indicator:checked { background: #4d8eff; border-color: #4d8eff; }
+QFrame#section { background-color: #23272d; border: 1px solid #353840; border-radius: 8px; }
+QSplitter::handle { background-color: #2a2d33; }
+QSplitter::handle:horizontal { width: 2px; }
+QStatusBar { background-color: #1b1e23; color: #888; border-top: 1px solid #2a2d33; }
+QToolTip { background-color: #2a2d33; border: 1px solid #3e4248; color: #e0e0e0; padding: 3px 6px; }
+"""
+
+
+@dataclass
+class QueuedJob:
+    """排队中的作业描述（点击开始后先入队，由调度器串行启动）。"""
+    kind: str                 # "copy" | "verify"
+    job_name: str
+    sources: list[str]
+    dest_root: str
+    generate_report: bool
+    conflict_policy: str = "keep"   # 仅 copy 用："keep" | "skip"
+    resume_from: object = None      # 仅 copy 用：ExistingLogInfo
+
+
+def classify_existing_logs(existing: list) -> tuple[list, list]:
+    """把目标目录中已有的日志分为（可续传, 已完成）两组。
+
+    判定以「是否存在未完成文件」为准，而非仅看整体 ``is_completed``。
+    旧口径只看整体状态：设备中途拔出等场景会把任务标成 Completed 却仍有
+    大量 failed/pending 文件，于是走「追加拷贝」分支整单重拷，断点续传失效。
+    只要还有未完成文件，就应提供续传（续传会自动跳过已验证文件、只重拷
+    失败/待办项）。返回 (unfinished, completed)。
+    """
+    unfinished = [e for e in existing if (not e.is_completed) or e.pending_files]
+    completed = [e for e in existing if e.is_completed and not e.pending_files]
+    return unfinished, completed
+
+
+class MainWindow(QMainWindow):
+    # 微信推送结果反馈（推送线程 → 主线程状态栏，Qt 自动队列连接）
+    push_notify = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("DIT OFFLOADER")
+        self.resize(1180, 760)
+        self.push_notify.connect(self._on_push_result)
+        self._worker_threads: list[WorkerThread] = []
+        self._active_workers: dict[str, CopyJobWorker | VerifyOnlyWorker] = {}
+        self._items: dict[str, JobItemWidget] = {}
+        self._threads: dict[str, WorkerThread] = {}       # job_name → 作业线程引用
+        self._job_by_worker: dict[int, str] = {}           # id(worker) → job_name
+        self._job_is_copy: dict[int, bool] = {}            # id(worker) → is_copy
+        self._last_renamed_map: dict[str, str] = {}        # 最近一次重命名映射
+        self._report_workers: dict[str, object] = {}       # job_name → ReportWorker
+        self._report_threads: dict[str, WorkerThread] = {} # job_name → 报告线程
+        self._job_by_report_worker: dict[int, str] = {}    # id(ReportWorker) → job_name
+        self._pending_finalization: dict[str, dict] = {}   # 待报告完成后回填的终态数据
+        # 每个作业运行期间收集的单文件错误（作业结束时合并成一个汇总弹窗，
+        # 替代旧版「每个失败文件弹一个模态框」——卡读不稳时会连环弹窗）
+        self._job_errors: dict[str, list[tuple[str, str]]] = {}
+        # ── 作业队列调度 ──
+        # 内部 key 形如 "JobName#3"：同名作业（同一目标追加拷贝）的
+        # _items/_threads 映射互不覆盖——旧版用 job_name 当 key，第二个
+        # 同名任务会把第一个的映射顶掉，旧任务的进度条从此停止更新。
+        self._pending_jobs: list[tuple[str, QueuedJob]] = []  # 等待执行的队列
+        self._job_seq: int = 0
+        self._job_display: dict[str, str] = {}                # key → 显示名
+        # 运行中任务的目标盘（按目标盘调度：同盘串行、异盘并发）
+        self._job_dest: dict[str, str] = {}
+        # 入队时的参数快照：作业运行期间用户可继续修改中间栏（为下一个
+        # 任务做准备），已提交的任务必须用提交时的源列表/重命名配置
+        self._job_sources: dict[str, list[str]] = {}
+        self._job_rename: dict[str, tuple[bool, str]] = {}    # key → (启用, sscl路径)
+        self._build_ui()
+        QApplication.instance().setStyleSheet(DARK_QSS)
+
+    def _build_ui(self) -> None:
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        header = QWidget()
+        header.setFixedHeight(42)
+        header.setStyleSheet("background: #14171c; border-bottom: 1px solid #2a2d33;")
+        hl = QHBoxLayout(header); hl.setContentsMargins(12, 0, 12, 0); hl.setSpacing(10)
+        lbl = QLabel("DIT OFFLOADER V1.0.4 — 拷卡 · 校验 · 文件名同步")
+        lbl.setStyleSheet("color: white; font-size: 14px; font-weight: 700;"
+                          "border: none; background: transparent;")
+        credit = QLabel("工部尚书府 GiveMeHanzo 开发    github.com/GiveMeHanzo")
+        credit.setStyleSheet("color: #8b949e; font-size: 12px;"
+                             "border: none; background: transparent;")
+        settings_btn = QPushButton("⚙ 设置")
+        settings_btn.setCursor(Qt.PointingHandCursor)
+        settings_btn.setToolTip("微信推送设置（pushplus）")
+        settings_btn.setStyleSheet(
+            "QPushButton { color: #8b949e; background: #21262d; "
+            "border: 1px solid #3e4248; border-radius: 4px; "
+            "padding: 2px 10px; font-size: 12px; }"
+            "QPushButton:hover { color: #e0e0e0; background: #3a4250; "
+            "border-color: #5f9efa; }")
+        settings_btn.clicked.connect(self._open_settings)
+        hl.addWidget(lbl); hl.addStretch(); hl.addWidget(credit)
+        hl.addWidget(settings_btn)
+        root.addWidget(header)
+
+        splitter = QSplitter(Qt.Horizontal)
+        self.drive_panel = DrivePanel()
+        self.copy_panel = CopyPanel()
+        self.queue_panel = QueuePanel()
+        splitter.addWidget(self.drive_panel)
+        splitter.addWidget(self.copy_panel)
+        splitter.addWidget(self.queue_panel)
+        splitter.setStretchFactor(0, 2); splitter.setStretchFactor(1, 4); splitter.setStretchFactor(2, 3)
+        splitter.setSizes([260, 480, 440])
+        root.addWidget(splitter, stretch=1)
+        self.setCentralWidget(central)
+        self.setStatusBar(QStatusBar())
+
+        self.drive_panel.pathSelected.connect(self.copy_panel.add_source_path)
+        self.copy_panel.startRequested.connect(self._on_start_copy)
+        self.copy_panel.verifyRequested.connect(self._on_start_verify)
+        self.copy_panel.configChanged.connect(self._refresh_start_state)
+        # 「清空已完成」：面板删卡片，主窗口同步清理 key 映射
+        self.queue_panel.finishedCleared.connect(self._on_finished_cleared)
+        self._refresh_start_state()
+
+    def _refresh_start_state(self) -> None:
+        has_src = bool(self.copy_panel.get_sources())
+        has_dst = bool(self.copy_panel.get_dest())
+        # 如果勾选了重命名但未导入 SSCL 文件，禁用开始按钮
+        rename_blocked = (
+            self.copy_panel.rename_cb.isChecked()
+            and not bool(self.copy_panel.get_sscl_path())
+        )
+        enabled = has_src and has_dst and not rename_blocked
+        self.copy_panel.start_btn.setEnabled(enabled)
+        self.copy_panel.verify_btn.setEnabled(has_src and has_dst)
+
+    # ── 拷贝 ──
+    def _on_start_copy(self) -> None:
+        sources = self.copy_panel.get_sources()
+        dest_root = self.copy_panel.get_dest()
+        job_name = self.copy_panel.get_job_name()
+        if not self._validate(sources, dest_root): return
+        if not self._check_sources_not_empty(sources): return
+        os.makedirs(dest_root, exist_ok=True)
+        self._scan_worker = ScanWorker(dest_root)
+        self._scan_thread = WorkerThread(self._scan_worker)
+        self._scan_worker.finished_ok.connect(self._on_scan_done_copy)
+        self._scan_worker.failed.connect(self._on_scan_failed)
+        self._pending_job = (job_name, sources, dest_root)
+        self._scan_thread.finished.connect(self._scan_thread.deleteLater)
+        self._scan_thread.start()
+
+    def _on_scan_done_copy(self, result: ScanResult) -> None:
+        job_name, sources, dest_root = self._pending_job
+        resume_from = None
+        if result.existing:
+            # 只要还有未完成文件就按「可续传」处理（见 classify_existing_logs
+            # 的说明）：避免设备拔出被误判为已完成、导致整单重拷。
+            unfinished, completed = classify_existing_logs(result.existing)
+            if unfinished:
+                names = "\n".join(f"  • {os.path.basename(e.xml_path)} ({len(e.pending_files)} 个待续传)" for e in unfinished)
+                msg = QMessageBox(self); msg.setWindowTitle("检测到中断的任务")
+                msg.setText("检测到目标目录存在未完成的拷贝任务：\n" + names)
+                msg.setInformativeText("是否继续未完成的拷贝，还是开启全新任务？")
+                cont = msg.addButton("继续未完成任务", QMessageBox.AcceptRole)
+                new_btn = msg.addButton("开启全新任务", QMessageBox.RejectRole)
+                msg.addButton("取消", QMessageBox.RejectRole); msg.exec()
+                if msg.clickedButton() is cont and unfinished: resume_from = unfinished[0]
+                elif msg.clickedButton() is new_btn: resume_from = None
+                else: return
+            elif completed:
+                names = "\n".join(f"  • {os.path.basename(e.xml_path)}" for e in completed)
+                msg = QMessageBox(self); msg.setWindowTitle("目标已备份过")
+                msg.setText("目标文件夹已进行过备份：\n" + names)
+                msg.setInformativeText("是否要在同一目录再次追加拷贝？")
+                yes = msg.addButton("追加备份", QMessageBox.AcceptRole)
+                msg.addButton("取消", QMessageBox.RejectRole); msg.exec()
+                if msg.clickedButton() is not yes: return
+        self._launch_copy_job(job_name, sources, dest_root, resume_from)
+
+    def _launch_copy_job(self, job_name: str, sources: list[str], dest_root: str, resume_from) -> None:
+        if resume_from is not None:
+            # 续传：任务名跟随被续传日志的名字（可能是之前的 J-1），继续写原日志
+            base = os.path.basename(resume_from.xml_path)
+            if base.endswith(XML_LOG_SUFFIX):
+                base = base[:-len(XML_LOG_SUFFIX)]
+            else:
+                base = job_name
+        else:
+            # 追加拷贝防重名：目标目录已有同名产物（或其他同目录任务在
+            # 排队/运行）时，任务名自动改为 J-1 / J-2…，XML 日志与 HTML
+            # 报告随任务名一起版本化，从提交那一刻就绝不冲突
+            base = self._reserve_job_base(dest_root, job_name)
+        self._enqueue_job(QueuedJob(
+            kind="copy", job_name=base, sources=list(sources),
+            dest_root=dest_root,
+            generate_report=self.copy_panel.is_report_enabled(),
+            conflict_policy=self.copy_panel.get_conflict_policy(),
+            resume_from=resume_from,
+        ))
+
+    # ── 仅校验 ──
+    def _on_start_verify(self) -> None:
+        sources = self.copy_panel.get_sources()
+        dest_root = self.copy_panel.get_dest()
+        job_name = self.copy_panel.get_job_name() + "_verify"
+        if not self._validate(sources, dest_root): return
+        if not self._check_sources_not_empty(sources): return
+        os.makedirs(dest_root, exist_ok=True)
+        self._enqueue_job(QueuedJob(
+            kind="verify", job_name=self._reserve_job_base(dest_root, job_name),
+            sources=list(sources), dest_root=dest_root,
+            generate_report=self.copy_panel.is_report_enabled(),
+        ))
+
+    # ── 作业队列：按目标盘调度（同盘串行、异盘并发）──
+    @staticmethod
+    def _norm_dest(path: str) -> str:
+        return os.path.normcase(os.path.normpath(path or ""))
+
+    def _reserve_job_base(self, dest_root: str, job_name: str) -> str:
+        """为追加拷贝分配不冲突的任务名：J → J-1 → J-2 …
+
+        占用来源：① 目标目录中已有的 *_log.xml / *_report.html；
+        ② 同一目标目录尚在排队/运行中的任务。任务名即 XML/HTML 的
+        基名，提交时改名后日志与报告天然不会覆盖任何已有产物。
+        """
+        taken: set[str] = set()
+        if os.path.isdir(dest_root):
+            for entry in os.listdir(dest_root):
+                if entry.endswith(XML_LOG_SUFFIX):
+                    taken.add(entry[:-len(XML_LOG_SUFFIX)])
+                elif entry.endswith(REPORT_SUFFIX):
+                    taken.add(entry[:-len(REPORT_SUFFIX)])
+        dest_key = self._norm_dest(dest_root)
+        for _key, qjob in self._pending_jobs:
+            if self._norm_dest(qjob.dest_root) == dest_key:
+                taken.add(qjob.job_name)
+        for akey in self._active_workers:
+            if self._norm_dest(self._job_dest.get(akey, "")) == dest_key:
+                taken.add(self._job_display.get(akey, ""))
+        if job_name not in taken:
+            return job_name
+        idx = 1
+        while f"{job_name}-{idx}" in taken:
+            idx += 1
+        return f"{job_name}-{idx}"
+
+    def _enqueue_job(self, job: QueuedJob) -> None:
+        self._job_seq += 1
+        key = f"{job.job_name}#{self._job_seq}"
+        item = self.queue_panel.add_job(job.job_name, job.dest_root)
+        item.set_status("Queued")
+        self._items[key] = item
+        self._job_display[key] = job.job_name
+        # 参数快照：运行中修改中间栏只影响之后提交的任务
+        self._job_sources[key] = list(job.sources)
+        if job.kind == "copy":
+            self._job_rename[key] = (self.copy_panel.is_rename_enabled(),
+                                     self.copy_panel.get_sscl_path())
+        item.cancelRequested.connect(lambda _name, k=key: self._on_cancel(k))
+        item.openDestRequested.connect(self._open_dest)
+        self._pending_jobs.append((key, job))
+        pos = f"（{self._job_display[key]} · 第 {len(self._pending_jobs)} 位）" \
+            if len(self._pending_jobs) > 1 else f"（{job.job_name}）"
+        self.statusBar().showMessage(f"已加入队列{pos}", 4000)
+        self._start_next_job()
+
+    def _start_next_job(self) -> None:
+        """调度器：同一目标盘的任务按入队顺序串行；不同目标盘的任务
+        并发执行（DIT 双重备份：同一张卡同时拷往两块盘互不等待）。
+        """
+        if not self._pending_jobs:
+            return
+        busy = {self._norm_dest(d) for d in self._job_dest.values()}
+        for i, (key, job) in enumerate(self._pending_jobs):
+            if self._norm_dest(job.dest_root) in busy:
+                continue  # 该目标盘有任务在跑，继续等
+            self._pending_jobs.pop(i)
+            if job.kind == "copy":
+                policy = NameConflictPolicy.KEEP if job.conflict_policy == "keep" \
+                    else NameConflictPolicy.SKIP
+                worker = CopyJobWorker(
+                    job_name=job.job_name, sources=job.sources,
+                    dest_root=job.dest_root, conflict_policy=policy,
+                    generate_report=job.generate_report,
+                    resume_from=job.resume_from,
+                )
+                is_copy = True
+            else:
+                worker = VerifyOnlyWorker(
+                    job_name=job.job_name, sources=job.sources,
+                    dest_root=job.dest_root,
+                    generate_report=job.generate_report,
+                )
+                is_copy = False
+            self._setup_common(worker, key, job, is_copy=is_copy)
+            return
+        # 队列中所有作业的目标盘都忙 → 等待下一次调度
+
+    # ── 公共 ──
+    def _validate(self, sources, dest_root) -> bool:
+        if not sources: QMessageBox.warning(self, "缺少源", "请先添加至少一个源文件或文件夹。"); return False
+        if not dest_root: QMessageBox.warning(self, "缺少目标", "请选择目标文件夹。"); return False
+        for s in sources:
+            if not os.path.exists(s): QMessageBox.warning(self, "源不存在", f"源路径不存在：\n{s}"); return False
+        return True
+
+    def _check_sources_not_empty(self, sources: list[str]) -> bool:
+        """快速预扫描：检测源路径中是否包含任何可拷贝文件。
+
+        用 has_copyable_file 找到第一个可拷贝文件即返回，
+        避免在 GUI 线程上 walk 整张大容量卡。
+        """
+        from core.scanner import has_copyable_file
+        if not has_copyable_file(sources):
+            QMessageBox.warning(self, "源为空", "所选的源路径中未找到任何可拷贝文件，请检查。")
+            return False
+        return True
+
+    def _setup_common(self, worker, key: str, job: QueuedJob, *, is_copy: bool) -> None:
+        """启动一个作业（由 _start_next_job 调度；卡片与信号已在入队时建好）。"""
+        thread = WorkerThread(worker)
+        item = self._items[key]
+        # 存储 id→key 映射，供 @Slot 方法通过 sender() 查找
+        self._job_by_worker[id(worker)] = key
+        self._job_is_copy[id(worker)] = is_copy
+        self._job_errors.pop(key, None)  # 同名作业重跑时清掉旧错误记录
+        # 直接连接到 MainWindow 的 @Slot 方法（MainWindow 是 QObject，在主线程）
+        # Qt 自动检测线程差异并使用 QueuedConnection，确保在主线程执行
+        worker.job_started.connect(self._on_worker_job_started)
+        worker.file_started.connect(self._on_worker_file_started)
+        worker.file_done.connect(self._on_worker_file_done)
+        worker.bytes_progress.connect(self._on_worker_bytes_progress)
+        worker.job_finished.connect(self._on_worker_job_finished)
+        worker.error.connect(self._on_worker_error)
+        self._active_workers[key] = worker
+        self._job_dest[key] = job.dest_root
+        self._worker_threads.append(thread)
+        self._threads[key] = thread
+        thread.finished.connect(thread.deleteLater)
+        self.copy_panel.set_running(True)
+        self.statusBar().showMessage(f"正在执行：{job.job_name}")
+        thread.start()
+
+    # ── Worker 信号槽（@Slot 装饰确保主线程执行）──
+
+    @Slot(str)
+    def _on_worker_job_started(self, _name_from_signal: str) -> None:
+        name = self._job_by_worker.get(id(self.sender()), "")
+        item = self._items.get(name)
+        if item: item.set_status("Copying")
+
+    @Slot(object)
+    def _on_worker_file_started(self, fp: object) -> None:
+        name = self._job_by_worker.get(id(self.sender()), "")
+        item = self._items.get(name)
+        if item:
+            st = getattr(fp, "status", "")
+            if st in ("copying", "Copying"): item.set_status("Copying")
+            elif st in ("verifying", "Verifying"): item.set_status("Verifying")
+
+    @Slot(object)
+    def _on_worker_file_done(self, fp: object) -> None:
+        pass  # 当前无需处理
+
+    @Slot(object, object, str)
+    def _on_worker_bytes_progress(self, done: object, total: object, _src: str) -> None:
+        name = self._job_by_worker.get(id(self.sender()), "")
+        item = self._items.get(name)
+        if item: item.set_progress(int(done), int(total))
+
+    @Slot(object)
+    def _on_worker_job_finished(self, summary: object) -> None:
+        worker = self.sender()
+        name = self._job_by_worker.get(id(worker), "")
+        is_copy = self._job_is_copy.get(id(worker), True)
+        self._on_job_finished(name, summary, is_copy)
+
+    @Slot(str, str)
+    def _on_worker_error(self, src: str, msg: str) -> None:
+        name = self._job_by_worker.get(id(self.sender()), "")
+        self._on_error(name, src, msg)
+
+    @Slot(str)
+    def _on_scan_failed(self, msg: str) -> None:
+        QMessageBox.critical(self, "扫描失败", msg)
+
+    def _on_job_finished(self, name: str, summary, is_copy: bool) -> None:
+        try:
+            item = self._items.get(name)
+            # 先获取 failed 值（后续报告生成时需用）
+            if is_copy:
+                failed_val = summary.failed
+                verified_val = summary.verified
+                skipped_val = summary.skipped
+                bytes_total = summary.bytes_total
+                bytes_verified = summary.bytes_verified
+                elapsed = summary.elapsed
+                aborted = summary.aborted
+            else:
+                failed_val = summary.mismatched + summary.missing
+                verified_val = summary.verified
+                skipped_val = 0
+                bytes_total = summary.bytes_total
+                bytes_verified = summary.bytes_done
+                elapsed = summary.elapsed
+                aborted = summary.aborted
+
+            # 先同步进度条到 100%，但不设 Done 状态（报告未生成完）
+            if item:
+                item.bar.setValue(100 if failed_val == 0 and not aborted else item.bar.value())
+                item.bar.setFormat("100%")
+                item.cancel_btn.setVisible(False)
+
+            self._active_workers.pop(name, None)
+            self._job_dest.pop(name, None)  # 先释放目标盘再调度，同盘任务才能被唤醒
+            # 按目标盘调度：流水线一结束就启动队列中下一个可运行的作业
+            # （报告在独立线程继续生成，与下一个作业并行——旧版也允许此行为）
+            self._start_next_job()
+            if not self._active_workers and not self._pending_jobs:
+                self.copy_panel.set_running(False)
+            disp = self._job_display.get(name, name)
+            if is_copy:
+                s = summary
+                head = "任务中断" if s.aborted else "任务完成"
+                msg = f"{head}：{disp}  ✓{s.verified} ✗{s.failed} ⏭{s.skipped}  耗时 {s.elapsed:.1f}s"
+            else:
+                s = summary; msg = f"校验完成：{disp}  源 {s.total_in_source} 个 ✓{s.verified} 缺失 {s.missing} 不一致 {s.mismatched}  耗时 {s.elapsed:.1f}s"
+            self.statusBar().showMessage(msg, 12000)
+            # 拷贝任务终态微信推送（成功/校验失败/中断）
+            if is_copy:
+                self._send_job_push(summary)
+            if not is_copy and getattr(summary, 'mismatched_files', None):
+                limit = 10; show = summary.mismatched_files[:limit]
+                more = f"\n… 共 {len(summary.mismatched_files)} 个" if len(summary.mismatched_files) > limit else ""
+                QMessageBox.warning(self, "校验不完整", f"以下文件校验失败：\n" + "\n".join(show) + more)
+            # 场记自动重命名（在报告生成之前执行；主线程，os.rename + XML 回写，快速）
+            if is_copy and not aborted:
+                self._maybe_rename_assets(summary, name)
+
+            # ── 报告生成 ──
+            # 移到后台线程，避免 probe/抽帧/HTML 构建卡住 UI。
+            if summary.generate_report and not aborted:
+                if item:
+                    item.set_status("Generating Report")
+                # 缓存本作业的最终状态数据，供报告完成槽回填
+                self._pending_finalization[name] = {
+                    "verified": verified_val, "failed": failed_val,
+                    "skipped": skipped_val, "bytes_total": bytes_total,
+                    "bytes_verified": bytes_verified, "elapsed": elapsed,
+                    "aborted": aborted,
+                }
+                self._launch_report(summary, name)
+            else:
+                # 无需生成报告：直接收尾
+                self._finalize_job(name, verified_val, failed_val, skipped_val,
+                                   bytes_total, bytes_verified, elapsed, aborted)
+        except Exception as e:
+            self.statusBar().showMessage(f"任务收尾异常: {e}", 10000)
+            # 异常路径也要释放作业线程
+            self._finalize_job(name, 0, 1, 0, 0, 0, 0.0, True)
+
+    def _launch_report(self, summary, key: str) -> None:
+        """在后台线程启动 ReportWorker 生成报告。key 为作业内部唯一键。"""
+        from gui.workers import ReportWorker
+        # 用该任务入队时的源列表快照（运行期间用户可能已改中间栏）
+        sources = self._job_sources.get(key) or self.copy_panel.get_sources()
+        renamed = self._last_renamed_map or None
+
+        report_worker = ReportWorker(
+            summary=summary, sources=sources, renamed_map=renamed,
+        )
+        report_thread = WorkerThread(report_worker)
+        # 用 id(worker) → key 映射，槽里通过 sender() 取回作业（与
+        # _on_worker_job_finished 同模式）。连接到 MainWindow 的 bound method，
+        # Qt 据此判定 receiver 在主线程，自动用 QueuedConnection 投递——
+        # 不能用 lambda（会被当 DirectConnection，槽跑在报告线程里导致
+        # "Timers cannot be stopped from another thread" 等崩溃）。
+        self._job_by_report_worker[id(report_worker)] = key
+        self._report_workers[key] = report_worker
+        self._report_threads[key] = report_thread
+        report_worker.finished.connect(self._on_report_finished)
+        report_worker.failed.connect(self._on_report_failed)
+        report_thread.finished.connect(report_thread.deleteLater)
+        report_thread.start()
+
+    @Slot(str)
+    def _on_report_finished(self, html_path: str) -> None:
+        """后台报告生成完成：回填最终状态、退出作业线程（主线程执行）。"""
+        worker = self.sender()
+        name = self._job_by_report_worker.pop(id(worker), "") if worker is not None else ""
+        fin = self._pending_finalization.pop(name, None)
+        if fin:
+            self._finalize_job(name, **fin)
+        if name:
+            self.statusBar().showMessage(
+                f"报告已生成: {os.path.basename(html_path)}", 8000)
+            self._cleanup_report_thread(name)
+
+    @Slot(str)
+    def _on_report_failed(self, msg: str) -> None:
+        """后台报告生成失败：仍需回填终态并退出作业线程（主线程执行）。"""
+        worker = self.sender()
+        name = self._job_by_report_worker.pop(id(worker), "") if worker is not None else ""
+        fin = self._pending_finalization.pop(name, None)
+        if fin:
+            # 报告失败不影响拷贝/校验本身的成败判定，按原结果回填
+            self._finalize_job(name, **fin)
+        if name:
+            self.statusBar().showMessage(f"报告生成失败: {msg}", 8000)
+            self._cleanup_report_thread(name)
+
+    def _cleanup_report_thread(self, name: str) -> None:
+        # 注意：WorkerThread 里已把 report_worker.finished/failed 连到了 thread.quit，
+        # 因此 report 线程此时已（或正在）自行退出；这里只做 wait 收尾，
+        # 不再调 quit()，避免对已经退出的线程重复操作。
+        self._report_workers.pop(name, None)
+        t = self._report_threads.pop(name, None)
+        if t is not None and t.isRunning():
+            t.wait(2000)
+
+    def _finalize_job(
+        self, name: str, verified: int, failed: int, skipped: int,
+        bytes_total: int, bytes_verified: int, elapsed: float,
+        aborted: bool,
+    ) -> None:
+        """回填作业项的最终状态、详情文字、提示音，并退出作业线程。"""
+        self._job_dest.pop(name, None)  # 释放目标盘，唤醒同盘排队任务
+        item = self._items.get(name)
+        if item:
+            if aborted:
+                item.set_status("Aborted")
+            elif failed > 0:
+                item.set_status("Error")
+            else:
+                item.set_status("Done")
+            item.detail_lbl.setText(
+                f"✓ {verified} 验证 · ✗ {failed} 失败 · ⏭ {skipped} 跳过 · "
+                f"{_human_size(bytes_verified)} / {_human_size(bytes_total)} · "
+                f"耗时 {elapsed:.1f}s")
+        # 合并展示本作业运行期间的单文件错误（最多 10 条，避免弹窗过长）
+        errors = self._job_errors.pop(name, None)
+        if errors:
+            limit = 10
+            lines = [f"• {os.path.basename(s)}：{m}" for s, m in errors[:limit]]
+            more = f"\n… 共 {len(errors)} 个文件失败" if len(errors) > limit else ""
+            QMessageBox.warning(
+                self, "拷贝/校验失败",
+                f"以下 {len(errors)} 个文件处理失败：\n" + "\n".join(lines) + more,
+            )
+        self._play_completion_sound()
+        # 安全退出作业线程（报告生成在独立线程，不阻塞此处）
+        t = self._threads.pop(name, None)
+        if t is not None and t.isRunning():
+            t.quit()
+            t.wait(3000)
+
+    def _on_error(self, name: str, src: str, msg: str) -> None:
+        """单文件错误只记录不弹窗（作业结束合并汇总）；作业级错误弹窗并收尾。"""
+        disp = self._job_display.get(name, name)
+        if src:
+            self.statusBar().showMessage(f"错误 [{disp}]: {msg}", 8000)
+            self._job_errors.setdefault(name, []).append((src, msg))
+            return
+        # 作业级错误（空间不足/作业异常等）：worker 已 emit error 并退出，
+        # job_finished 不会再触发，需在此收尾并调度下一个作业。
+        QMessageBox.warning(self, "任务错误", msg)
+        self.statusBar().showMessage(f"错误 [{disp}]: {msg}", 8000)
+        self._active_workers.pop(name, None)
+        self._job_dest.pop(name, None)
+        self._start_next_job()
+        if not self._active_workers and not self._pending_jobs:
+            self.copy_panel.set_running(False)
+        self._finalize_job(name, 0, 1, 0, 0, 0, 0.0, True)
+
+    def _on_cancel(self, name: str) -> None:
+        # 排队中：直接移出队列并删掉卡片
+        for i, (k, _job) in enumerate(self._pending_jobs):
+            if k == name:
+                self._pending_jobs.pop(i)
+                item = self._items.pop(name, None)
+                self._job_display.pop(name, None)
+                self._job_sources.pop(name, None)
+                self._job_rename.pop(name, None)
+                if item is not None:
+                    self.queue_panel.remove_item(item)
+                self.statusBar().showMessage("已移除排队中的任务", 4000)
+                return
+        worker = self._active_workers.get(name)
+        if worker:
+            worker.request_cancel()
+        self.statusBar().showMessage(
+            f"已请求取消：{self._job_display.get(name, name)}（等待当前文件完成）", 5000)
+
+    @Slot(str)
+    def _open_dest(self, path: str) -> None:
+        """在系统文件管理器中打开已完成任务的目标目录。"""
+        if path and os.path.isdir(path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    # ── 设置与微信推送 ──
+    @Slot()
+    def _open_settings(self) -> None:
+        """右上角 ⚙ 设置按钮：pushplus 推送配置对话框。"""
+        dlg = SettingsDialog(self)
+        dlg.exec()
+
+    def _send_job_push(self, summary: JobSummary) -> None:
+        """拷贝任务终态推送微信（pushplus）。
+
+        开关关闭或未配置 Token 时静默跳过；HTTP 调用在守护线程执行，
+        推送结果经 push_notify 信号回主线程状态栏，任何异常不影响主流程。
+        """
+        try:
+            enabled, token = load_pushplus_settings()
+            if not enabled or not token:
+                return
+            total = max(summary.total_files,
+                        summary.verified + summary.failed + summary.skipped)
+            video = min(summary.video_files, total)
+            title, html = build_copy_result_message(
+                job_name=summary.job_name,
+                total=total, video=video, nonvideo=max(total - video, 0),
+                verified=summary.verified, failed=summary.failed,
+                skipped=summary.skipped, aborted=summary.aborted,
+            )
+
+            def work() -> None:
+                ok, msg = send_pushplus(token, title, html)
+                if ok:
+                    self.push_notify.emit(f"微信推送已发送：{title}")
+                else:
+                    self.push_notify.emit(f"微信推送失败：{msg}")
+
+            threading.Thread(
+                target=work, daemon=True, name="pushplus-notify"
+            ).start()
+        except Exception:
+            pass  # 推送失败绝不影响拷贝主流程
+
+    @Slot(str)
+    def _on_push_result(self, msg: str) -> None:
+        self.statusBar().showMessage(msg, 8000)
+
+    @Slot(object)
+    def _on_finished_cleared(self, removed: object) -> None:
+        """「清空已完成」后同步清理主窗口里对应卡片的 key 映射。"""
+        ids = {id(it) for it in removed}
+        for key, it in list(self._items.items()):
+            if id(it) in ids:
+                self._items.pop(key, None)
+                self._job_display.pop(key, None)
+                self._job_dest.pop(key, None)
+                self._job_sources.pop(key, None)
+                self._job_rename.pop(key, None)
+
+    def _maybe_rename_assets(self, summary, key: str) -> None:
+        """如果启用了场记重命名，在拷贝完成后执行自动重命名。
+
+        使用入队时的配置快照：作业运行期间用户可能已经为下一个任务
+        修改了重命名开关/SSCL 文件，不能读当前控件状态。
+        """
+        self._last_renamed_map = {}
+        snap = self._job_rename.pop(key, None)
+        enabled = bool(snap and snap[0])
+        sscl_path = snap[1] if snap else ""
+        if not enabled:
+            return
+        log_path = summary.xml_path
+        dest_root = summary.dest_root
+
+        if not os.path.isfile(sscl_path):
+            self.statusBar().showMessage(f"场记文件不存在，跳过重命名: {sscl_path}", 8000)
+            return
+        if not os.path.isfile(log_path):
+            self.statusBar().showMessage(f"日志文件不存在，跳过重命名: {log_path}", 8000)
+            return
+
+        try:
+            from core.renamer import rename_media_assets
+            result = rename_media_assets(sscl_path, log_path, dest_root)
+            # 构建 renamed_map 供报告使用：{normcase(旧路径): 新路径}
+            for entry in result.renamed:
+                self._last_renamed_map[os.path.normcase(entry["old_path"])] = entry["new_path"]
+            if result.status == "error":
+                self.statusBar().showMessage(
+                    f"场记重命名失败: {'; '.join(result.errors[:2])}", 10000
+                )
+                QMessageBox.warning(self, "重命名失败",
+                    f"自动重命名出错：\n" + "\n".join(result.errors[:5]))
+            else:
+                self.statusBar().showMessage(
+                    f"场记重命名完成: {result.renamed_count} 个文件已改名"
+                    + (f", {result.not_found_count} 个未匹配" if result.not_found_count else "")
+                    + (f", {result.error_count} 个失败" if result.error_count else ""),
+                    12000,
+                )
+        except Exception as e:
+            self.statusBar().showMessage(f"场记重命名异常: {e}", 8000)
+
+    def _play_completion_sound(self) -> None:
+        """任务完成提示音（跨平台）。"""
+        try:
+            if sys.platform == "win32":
+                import winsound
+                winsound.MessageBeep(winsound.MB_OK)
+            else:
+                QApplication.beep()
+        except Exception:
+            pass
+
+    def closeEvent(self, event) -> None:
+        running = [w for w in self._active_workers.values()]
+        if running:
+            ret = QMessageBox.question(self, "确认退出",
+                f"还有 {len(running)} 个任务正在运行，确定退出吗？\n（运行中的文件会写为中断状态）",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes: event.ignore(); return
+            for w in running: w.request_cancel()
+        for t in self._worker_threads:
+            if t.isRunning(): t.quit(); t.wait(2000)
+        # 等待后台报告线程退出
+        for t in self._report_threads.values():
+            if t.isRunning(): t.quit(); t.wait(2000)
+        event.accept()
+
+
+__all__ = ["MainWindow"]

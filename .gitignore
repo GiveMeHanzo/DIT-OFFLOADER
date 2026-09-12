@@ -29,3 +29,6 @@ DIT ICON2.png
 
 # Environment
 .env
+
+# PyInstaller local cache (root-owned global cache workaround)
+.pyinstaller_cache/
