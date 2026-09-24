@@ -10,8 +10,21 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
+
+
+def _no_window_kwargs() -> dict:
+    """GUI 子进程调用参数：Windows 下禁止为 ffmpeg/ffprobe 弹控制台黑窗。
+
+    打包版是 console=False 的窗口程序，启动控制台子进程时 Windows 会为
+    每个子进程弹出一个一闪而过的黑色控制台窗口（报告阶段每个视频要
+    探测 1 次 + 抽 3 帧，几十条素材会连续闪几十次）。其他平台无此行为。
+    """
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
 
 
 # 查找结果在整个进程内不变（main.py 启动时已把 ffmpeg 路径加入 PATH），
@@ -88,6 +101,7 @@ def probe_video(filepath: str, timeout: float = 30.0) -> Optional[VideoMeta]:
             [ffprobe, "-v", "quiet", "-print_format", "json",
              "-show_format", "-show_streams", filepath],
             capture_output=True, text=True, encoding="utf-8", timeout=timeout,
+            **_no_window_kwargs(),
         )
         if proc.returncode != 0:
             return None

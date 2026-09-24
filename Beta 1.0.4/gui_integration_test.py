@@ -144,7 +144,10 @@ def test_resume_job() -> None:
     assert "error" not in captured, f"续传出错: {captured.get('error')}"
     summary = captured["summary"]
     print(f"   续传汇总: verified={summary.verified} skipped={summary.skipped}")
-    assert summary.verified == 1, "仅续传剩余1个"
+    # 1.0.4 起续传不信任上次已 verified 的记录，而是对目标盘重新校验
+    # （防静默损坏）：verified = 1 个重校验 + 1 个新拷贝校验，skipped=0
+    assert summary.verified == 2, "重校验1个 + 新拷贝校验1个"
+    assert summary.skipped == 0, "已验证文件不再按 skip 处理"
     assert summary.failed == 0
     # 续传后 XML 标记 Completed
     info2 = find_existing_logs(dest)[0]

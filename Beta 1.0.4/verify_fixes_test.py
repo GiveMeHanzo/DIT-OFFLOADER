@@ -93,7 +93,7 @@ def test_has_copyable_file() -> None:
         withclip = os.path.join(tmp, "card")
         os.makedirs(os.path.join(withclip, "DCIM", "100EOS"))
         open(os.path.join(withclip, ".Spotlight-V100", ) if os.path.isdir(
-            os.path.join(withclip, ".Spotlight-V100")) else "/dev/null", "wb").close()
+            os.path.join(withclip, ".Spotlight-V100")) else os.devnull, "wb").close()
         with open(os.path.join(withclip, "DCIM", "100EOS", "A001.mxf"), "wb") as f:
             f.write(b"x" * 16)
         ok("嵌套目录有素材 → True", has_copyable_file([withclip]))
@@ -512,11 +512,13 @@ def test_tree_rebuild() -> None:
         panel.refresh_drives()
         ok("每次刷新都换新模型（强制重枚举）", panel.model is not m1)
 
-        # 浏览位置在刷新后保留
+        # 浏览位置在刷新后保留（Windows 的 QFileSystemModel 返回正斜杠路径，
+        # 与 os.path 形式不同 → 两侧都经 normpath 归一化后再比较）
         panel.tree.setRootIndex(panel.model.index(tmp))
         panel.refresh_drives()
         ok("目录存在时刷新保留浏览位置",
-           panel.model.filePath(panel.tree.rootIndex()) == tmp)
+           os.path.normpath(panel.model.filePath(panel.tree.rootIndex()))
+           == os.path.normpath(tmp))
 
         # 模拟格式化：目录被整个替换/清空 → 刷新后回落到根，不再显示旧内容
         shutil.rmtree(tmp)

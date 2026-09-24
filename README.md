@@ -18,7 +18,7 @@
 
 ## 从Release下载打包好的exe或者dmg
 
-最新版本：[**Beta 1.0.4**](https://github.com/GiveMeHanzo/DIT-OFFLOADER/releases/tag/v1.0.4)（macOS DMG 已上传；Windows 版即将发布）
+最新版本：[**Beta 1.0.4**](https://github.com/GiveMeHanzo/DIT-OFFLOADER/releases/tag/v1.0.4)（macOS DMG 与 Windows exe 均已上传）
 
 ┌──────────────────────────────────────────────────────────────────────────────
 │  Windows 安装与启动

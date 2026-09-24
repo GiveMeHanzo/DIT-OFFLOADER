@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from report.ffprobe_utils import _find_ffprobe as _find_ffprobe_base
+from report.ffprobe_utils import _no_window_kwargs
 
 
 @functools.lru_cache(maxsize=1)
@@ -100,6 +101,7 @@ def _extract_one(
             ],
             capture_output=True,
             timeout=timeout,
+            **_no_window_kwargs(),
         )
         if proc.returncode == 0 and proc.stdout:
             return base64.b64encode(proc.stdout).decode("ascii")
@@ -118,6 +120,7 @@ def _get_duration(filepath: str) -> float:
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", filepath],
             capture_output=True, text=True, encoding="utf-8", timeout=10,
+            **_no_window_kwargs(),
         )
         if proc.returncode == 0 and proc.stdout.strip():
             return float(proc.stdout.strip())

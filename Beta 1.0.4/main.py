@@ -148,6 +148,9 @@ def main() -> int:
     # ── FFmpeg 路径探测 ──
     # 冰冻环境（macOS .app bundle）的 PATH 缺少 brew 路径，导致 shutil.which
     # 找不到 ffmpeg/ffprobe。这里显式检查常见安装目录。
+    # Windows 打包版同样需要：从资源管理器/更新器等父进程启动时，继承的
+    # PATH 可能是安装 ffmpeg（winget/scoop/choco）之前的旧值，shutil.which
+    # 会探测失败——显式补探测，保证报告缩略图/元数据功能不静默缺失。
     # 开发环境走完整 os.walk 探测以覆盖 winget/scoop/choco。
     if _frozen and sys.platform == "darwin":
         ffmpeg_bin = ""
@@ -157,7 +160,7 @@ def main() -> int:
                 break
         if ffmpeg_bin:
             os.environ["PATH"] = ffmpeg_bin + os.pathsep + os.environ.get("PATH", "")
-    elif not _frozen:
+    else:
         _ensure_ffmpeg_path()
 
     # ── 全局异常勾子 ──
